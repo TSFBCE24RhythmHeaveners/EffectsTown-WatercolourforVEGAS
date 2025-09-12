@@ -47,7 +47,7 @@ Description:
 Globals
 *******************************************************************************************************/
 OfxHost* global_OFXHost{ nullptr };
-HostData global_hostData{};
+HostData global_hostData{ com.sonycreativesoftware.vegas };
 const OfxImageEffectSuiteV1* global_EffectSuite{ nullptr };
 const OfxPropertySuiteV1* global_PropertySuite{ nullptr };
 const OfxParameterSuiteV1* global_ParameterSuite{ nullptr };
