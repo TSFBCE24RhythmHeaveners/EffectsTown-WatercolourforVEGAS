@@ -37,9 +37,9 @@ Description:
 #include "after-effects-parameter-helper.h"
 #include "..\..\common\util.h"
 
-#include "..\..\common\simd-cpuid.h"
-#include "..\..\common\simd-f32.h"
-#include "..\..\common\simd-uint32.h"
+#include "simd-cpuid.h"
+#include "simd-f32.h"
+#include "simd-uint32.h"
 
 template <SimdFloat S>
 struct RenderData {
@@ -439,6 +439,7 @@ ParameterList read_parameters() {
 			break;
 		case ParameterType::list:			
 			p.value_string = ParameterHelper::ReadListAsString(p.id, p.list);
+			break;
 		case ParameterType::colour:
 			auto pixel = ParameterHelper::ReadColour(p.id);
 			p.red = pixel.red / 255.0f;

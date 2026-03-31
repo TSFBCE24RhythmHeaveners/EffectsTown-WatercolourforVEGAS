@@ -37,7 +37,7 @@ Description:
 #include "openfx-parameter-helper.h"
 #include "openfx-instance-data.h"
 
-#include "../../common/simd-cpuid.h"
+#include "simd-cpuid.h"
 
 #include <exception>
 #include <string.h>
@@ -200,7 +200,7 @@ static OfxStatus openfx_on_load_action(void) {
     if (!global_ParameterSuite)return kOfxStatErrMissingHostFeature;
 
     global_MultiThreadSuite = static_cast<const OfxMultiThreadSuiteV1*>(global_OFXHost->fetchSuite(global_OFXHost->host, kOfxMultiThreadSuite, 1));
-    if (!global_ParameterSuite) return kOfxStatErrMissingHostFeature;
+    if (!global_MultiThreadSuite) return kOfxStatErrMissingHostFeature;
 
     char* cstr;
     int count;

@@ -6,3 +6,11 @@
 
 .vs/
 .vscode/
+.claude/
+
+build/
+public_html/
+
+
+CLAUDE.md
+.claude/

@@ -31,26 +31,44 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     <link rel="prefetch" href="./main-background-cpp.wasm" as="fetch" type="application/wasm" crossorigin>
     <link rel="prefetch" href="./main-render-worker-cpp.js">     
     <link rel="prefetch" href="./main-render-worker-cpp.wasm" as="fetch" type="application/wasm" crossorigin>
+    <link rel="prefetch" href="./main-render-worker-cpp-simd.js">
+    <link rel="prefetch" href="./main-render-worker-cpp-simd.wasm" as="fetch" type="application/wasm" crossorigin>
     <meta charset="utf-8">
     <title>Effects Town</title>
     <style>
-        html, body, canvas{
-            background-color:rgb(255, 255, 255);
+        html, body{
+            background-color:rgb(184, 184, 184);
             margin:0;
             padding: 0;
             overflow:hidden;
             color: black;
-            
             width:100%;
             height:100%;
+        }
+        canvas{
+            background-color:rgb(255, 255, 255);
+            border:3px solid rgb(92, 92, 92);
+            box-sizing:border-box;
+            box-shadow:0 10px 24px rgba(0, 0, 0, 0.16);
         }
         #canvasholder{
           top:0px;
           left:0px;
           width: calc(100% - 25em);
           height:100%;
+          background-color:rgb(184, 184, 184);
+          padding:4px;
+          box-sizing:border-box;
           z-index: 1;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          container-type: size;
         }
+        .aspect-auto  { width:100%; height:100%; }
+        .aspect-1-1   { width: min(100cqw, 100cqh);          height: min(100cqh, 100cqw); }
+        .aspect-16-9  { width: min(100cqw, 100cqh * 16 / 9); height: min(100cqh, 100cqw * 9 / 16); }
+        .aspect-9-16  { width: min(100cqw, 100cqh * 9 / 16); height: min(100cqh, 100cqw * 16 / 9); }
         #parameters{
           position:absolute;
           top:0px;
@@ -60,16 +78,72 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
           margin:0px;
           float:right;
           background-color:rgb(255, 255, 255);
+          border-left:1px solid rgb(196, 196, 196);
           padding:5px;
+          overflow-y:auto;
+        }
+        .paramheading{
+          font-weight:bold;
+          margin-bottom:4px;
+        }
+        .menuheading{
+          font-weight:bold;
+          margin-bottom:4px;
+          display:block;
+        }
+        .paramrow{
+          text-align:left;
+          margin:3px 0;
+        }
+        .paramlabel{
+          display:block;
+          font-size:0.82em;
+          margin-bottom:1px;
+          white-space:nowrap;
+          overflow:hidden;
+          text-overflow:ellipsis;
+        }
+        .paramcontrols{
+          display:flex;
+          align-items:center;
+          gap:4px;
+        }
+        .paramslider{
+          flex:1;
+          min-width:0;
+        }
+        .paramnumber{
+          width:4.5em;
+          font-size:0.82em;
+          min-width:0;
+        }
+        .paramselect{
+          width:100%;
+          font-size:0.82em;
+        }
+        .paramgroup{
+          margin-left:6px;
+          padding-left:8px;
+          border-left:2px solid #aaaaaa;
+          margin-top:3px;
+        }
+        .paramgroupname{
+          font-size:0.88em;
+          font-weight:bold;
+          color:#444444;
+          margin-bottom:3px;
         }
         .menugroup{
             margin:auto;
-            border-radius: 25px;
-            border: 2px solid #777777;
-            padding:0.5em;
+            border-radius: 14px;
+            border: 1px solid #b8b8b8;
+            padding:0.45em 0.5em;
             text-align:center;           
-            
+            box-shadow:0 1px 2px rgba(0, 0, 0, 0.04);
           }
+        #parameters .menugroup + .menugroup{
+          margin-top:5px;
+        }
         /*Buttons*/
         .button{
           display:inline-block;
@@ -77,7 +151,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
           margin: auto;
           background:white;
           border-radius: 10px;
-          border: 2px solid #777777;
+          border: 1px solid #a7a7a7;
           padding:0.5em;
           font-size:1.2em;
           cursor: pointer;  
@@ -97,7 +171,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
           z-index: 5;
           background:white;
           border-radius: 10px;
-          border: 2px solid #777777;
+          border: 1px solid #aaaaaa;
           padding:0.2em;
           font-size:1.0em;
           cursor: pointer;  
@@ -112,6 +186,12 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         }
         .buttonsmaller:hover{
           background-image: linear-gradient(#f9ecdb 45%,#f9cc8b 100%, #f9dcbb);
+        }
+        .buttonsmaller:disabled{
+          cursor: default;
+          color:#666666;
+          border-color:#c4c4c4;
+          background-image: linear-gradient(#f4f4f4 45%,#e4e4e4 100%, #f4f4f4);
         }
         [type="radio"]{
             appearance: none;
@@ -137,25 +217,93 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
           .radiolist label:last-of-type{
             border-radius: 0 0.5em 0.5em 0;
           }
-    </style>      
+        .seedinput{
+          width:calc(100% - 1.2em);
+          font-size:0.9em;
+          padding:0.2em 0.4em;
+          border:1px solid #777777;
+          border-radius:4px;
+          margin-top:4px;
+          box-sizing:border-box;
+        }
+        .resetbutton{
+          display:block;
+          width:calc(100% - 1em);
+          margin: 7px auto 1px auto;
+          background:white;
+          border-radius: 10px;
+          border: 1px solid #aaaaaa;
+          padding:0.3em;
+          font-size:0.9em;
+          cursor: pointer;
+          background-image: linear-gradient(#ffffff 45%,#eeeeee 100%, #ffffff);
+        }
+        .resetbutton:hover{
+          background-image: linear-gradient(#f9ecdb 45%,#f9cc8b 100%, #f9dcbb);
+        }
+        .savestatus{
+          min-height:1.2em;
+          margin-top:4px;
+          font-size:0.82em;
+          color:#444444;
+        }
+        .titleimage{
+          display:block;
+          width:100%;
+          height:auto;
+          margin:0 auto 8px auto;
+        }
+        .titlelink{
+          display:block;
+          text-decoration:none;
+          color:inherit;
+        }
+        .saveimagebuttons{
+          display:flex;
+          gap:0.2em;
+          justify-content:center;
+          flex-wrap:nowrap;
+        }
+        .saveimagebuttons .buttonsmaller{
+          min-width:0;
+          flex:1 1 0;
+          margin-right:0;
+          padding:0.2em 0.1em;
+        }
+    </style>
   </head>
   <body>    
     <div id="canvasholder">
-      <canvas id="canvas"></canvas> 
+      <canvas id="canvas" class="aspect-auto"></canvas>
     </div>
     
     
     <div id="parameters">
+      <a href="../" class="titlelink"><img src="/images/effectstowntitle.jpg" alt="Effects Town" class="titleimage"></a>
       <!--<a class="buttonsmaller" id="aspect-auto">Auto</a>-->
       <div class="menugroup">
-        Aspect Ratio<br>
-        <div class="radiolist"><input id="i1" name="iterations" type="radio" checked/><label for="i1">Auto 
-          </label><input id="i2" name="iterations" type="radio" /><label for="i2">1:1
-          </label><input id="i3" name="iterations" type="radio" /><label for="i3">16:9 
+        <span class="menuheading">Save Image</span>
+        <div class="saveimagebuttons">
+          <button type="button" id="save-image-4k" class="buttonsmaller" disabled>4k</button>
+          <button type="button" id="save-image-8k" class="buttonsmaller" disabled>8k</button>
+          <button type="button" id="save-image-16k" class="buttonsmaller" disabled>16k</button>
+        </div>
+        <div id="save-image-status" class="savestatus"></div>
+      </div>
+      <div class="menugroup">
+        <span class="menuheading">Aspect Ratio</span>
+        <div class="radiolist"><input id="i1" name="aspect" type="radio" value="auto" checked/><label for="i1">Auto
+          </label><input id="i2" name="aspect" type="radio" value="1-1"/><label for="i2">1:1
+          </label><input id="i3" name="aspect" type="radio" value="16-9"/><label for="i3">16:9
+          </label><input id="i4" name="aspect" type="radio" value="9-16"/><label for="i4">9:16
           </label>
         </div>
       </div>
+      <div class="menugroup">
+        <span class="menuheading">Seed</span>
+        <input type="text" id="seed-input" class="seedinput" value="Effects Town">
+      </div>
     </div>   
   </body>
-  <script src=main-cpp.js></script>
+  <script src="./main-cpp.js"></script>
 </html>  

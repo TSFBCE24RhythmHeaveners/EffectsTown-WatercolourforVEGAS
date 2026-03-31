@@ -27,6 +27,48 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 *********************************************************************************************************/
 #pragma once
 
+// Canonical x64 check used by all headers.
+#if defined(_M_X64) || defined(__x86_64)
+	#define MT_SIMD_ARCH_X64 1
+#else
+	#define MT_SIMD_ARCH_X64 0
+#endif
+
+// Canonical WebAssembly check used by all headers.
+#if defined(__wasm__) || defined(__wasm32__) || defined(__wasm64__)
+	#define MT_SIMD_ARCH_WASM 1
+#else
+	#define MT_SIMD_ARCH_WASM 0
+#endif
+
+// Only MSVC exposes vector lane member fields (m128_f32, m256i_i32, ...).
+#if defined(_MSC_VER) && !defined(__clang__)
+	#define MT_SIMD_HAS_MSVC_VECTOR_MEMBERS 1
+#else
+	#define MT_SIMD_HAS_MSVC_VECTOR_MEMBERS 0
+#endif
+
+// GCC/Clang need software shims for non-standard SIMD helper intrinsics.
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+	#define MT_SIMD_USE_PORTABLE_X86_SHIMS 0
+#else
+	#define MT_SIMD_USE_PORTABLE_X86_SHIMS 1
+#endif
+
+// Math backend selection for transcendental SIMD functions.
+// MT_USE_SVML is the only backend switch; all other builds use native code paths.
+#ifndef MT_USE_SVML
+	#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		#define MT_USE_SVML 1
+	#else
+		#define MT_USE_SVML 0
+	#endif
+#endif
+
+#if MT_USE_SVML && !MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+	#error "MT_USE_SVML is only supported with MSVC."
+#endif
+
 namespace mt::environment {
 
 
@@ -52,23 +94,27 @@ namespace mt::environment {
 #endif
 
 
-#if defined(__EMSCRIPTEN__)
-	constexpr bool emsctipten = true;
+#if MT_SIMD_ARCH_X64
+	constexpr static bool is_x86_64 = true;
 #else
-	constexpr static bool is_emsctipten = false;
-#endif 
+	constexpr static bool is_x86_64 = false;
+#endif
 
-
-//Check the arhitecture
-#if defined(_M_X64) || defined(__x86_64)
-	constexpr static bool is_x64 = true;
+#if MT_SIMD_ARCH_WASM
+	constexpr static bool is_wasm = true;
 #else
-	constexpr static bool is_x64 = false;
+	constexpr static bool is_wasm = false;
+#endif
+
+#if MT_SIMD_ARCH_WASM && defined(__wasm_simd128__)
+	constexpr static bool is_wasm_simd_level_1 = true;
+#else
+	constexpr static bool is_wasm_simd_level_1 = false;
 #endif
 
 
 //MSVC++ does not define SSE macros 
-#if (defined(_MSC_VER ) && defined(_M_X64))
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS && MT_SIMD_ARCH_X64
 	#if !defined(__SSE__)
 		#define __SSE__ 1
 	#endif
@@ -147,36 +193,90 @@ namespace mt::environment {
 	constexpr static bool compiler_has_fma = false;
 #endif
 
-#if defined(__AVX512F__)
+#if defined(__F16C__)
+	constexpr static bool compiler_has_f16c = true;
+#else
+	constexpr static bool compiler_has_f16c = false;
+#endif
+
+	// WebAssembly SIMD support is compile-time selected only.
+	constexpr static bool compiler_has_wasm_simd128 = is_wasm_simd_level_1;
+
+	// Selected math backend.
+	constexpr static bool use_svml = (MT_USE_SVML != 0);
+	constexpr static bool uses_runtime_x86_dispatch = MT_SIMD_HAS_MSVC_VECTOR_MEMBERS && is_x86_64;
+
+
+// Compile-time gating for full SIMD type declarations.
+// MSVC is intentionally permissive to support runtime dispatch builds.
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+	#define MT_SIMD_ALLOW_LEVEL3_TYPES 1
+	#define MT_SIMD_ALLOW_LEVEL4_TYPES 1
+#else
+	#if defined(__AVX2__)
+		#define MT_SIMD_ALLOW_LEVEL3_TYPES 1
+	#else
+		#define MT_SIMD_ALLOW_LEVEL3_TYPES 0
+	#endif
+
+	#if defined(__AVX512F__) && defined(__AVX512DQ__)
+		#define MT_SIMD_ALLOW_LEVEL4_TYPES 1
+	#else
+		#define MT_SIMD_ALLOW_LEVEL4_TYPES 0
+	#endif
+#endif
+
+#if defined(MT_FORCE_COMPILER_NO_AVX512)
+	constexpr static bool compiler_has_avx512f = false;
+#elif defined(__AVX512F__)
 	constexpr static bool compiler_has_avx512f = true;
 #else
 	constexpr static bool compiler_has_avx512f = false;
 #endif
 
-#if defined(__AVX512DQ__)
+#if defined(MT_FORCE_COMPILER_NO_AVX512)
+	constexpr static bool compiler_has_avx512dq = false;
+#elif defined(__AVX512DQ__)
 	constexpr static bool compiler_has_avx512dq = true;
 #else
 	constexpr static bool compiler_has_avx512dq = false;
 #endif
 
-#if defined(__AVX512VL__)
+#if defined(MT_FORCE_COMPILER_NO_AVX512)
+	constexpr static bool compiler_has_avx512vl = false;
+#elif defined(__AVX512VL__)
 	constexpr static bool compiler_has_avx512vl = true;
 #else
 	constexpr static bool compiler_has_avx512vl = false;
 #endif
 
 
-#if defined(__AVX512BW__)
+#if defined(MT_FORCE_COMPILER_NO_AVX512)
+	constexpr static bool compiler_has_avx512bw = false;
+#elif defined(__AVX512BW__)
 	constexpr static bool compiler_has_avx512bw = true;
 #else
 	constexpr static bool compiler_has_avx512bw = false;
 #endif
 
-#if defined(__AVX512CD__)
+#if defined(MT_FORCE_COMPILER_NO_AVX512)
+	constexpr static bool compiler_has_avx512cd = false;
+#elif defined(__AVX512CD__)
 	constexpr static bool compiler_has_avx512cd = true;
 #else
 	constexpr static bool compiler_has_avx512cd = false;
 #endif
+
+	// Compiler-mode x86_64 microarchitecture level checks.
+	constexpr static bool is_x86_64_level_1 = is_x86_64 && compiler_has_sse && compiler_has_sse2;
+	constexpr static bool is_x86_64_level_2 = is_x86_64_level_1 && compiler_has_sse3 && compiler_has_ssse3 && compiler_has_sse4_1 && compiler_has_sse4_2;
+	constexpr static bool is_x86_64_level_3 = is_x86_64_level_2 && compiler_has_avx && compiler_has_avx2 && compiler_has_fma && compiler_has_f16c;
+	constexpr static bool is_x86_64_level_4 = is_x86_64_level_3 && compiler_has_avx512f && compiler_has_avx512dq && compiler_has_avx512vl && compiler_has_avx512bw && compiler_has_avx512cd;
+
+	// Test/runtime-dispatch aware availability checks.
+	constexpr static bool compiler_can_use_x86_64_level_1_types = uses_runtime_x86_dispatch ? is_x86_64 : is_x86_64_level_1;
+	constexpr static bool compiler_can_use_x86_64_level_3_types = uses_runtime_x86_dispatch ? (MT_SIMD_ALLOW_LEVEL3_TYPES != 0) : is_x86_64_level_3;
+	constexpr static bool compiler_can_use_x86_64_level_4_types = uses_runtime_x86_dispatch ? (MT_SIMD_ALLOW_LEVEL4_TYPES != 0) : is_x86_64_level_4;
 
 
 
@@ -190,5 +290,3 @@ namespace mt::environment {
 
 
  
-
-

@@ -41,6 +41,8 @@ SimdNativeFloat64	- A Typedef referring to one of the above types.  Chosen based
 
 Checking CPU Support:
 Unless you are using a SimdNative typedef, you must check for CPU support before using any of these types.
+- MSVC - You may check at runtime or compile time.  (compile time checks generally results in much faster code)
+- GCC/Clang - You must check at compile time (due to compiler limitations)
 
 Types reqpresenting floats, doubles, ints, longs etc are arranged in microarchitecture level groups.
 Generally CPUs have more SIMD support for floats than ints.
@@ -48,12 +50,10 @@ Ensure the CPU supports the full "level" if you need to use more than one type.
 
 
 To check support at compile time:
-	- Use compiler_level_supported()
-	- If you won't use any of the type conversion functions you can use compiler_supported()
-
+	- For GCC you may need pre-processor defines to gate the calling site.
+	
 To check support at run time:
-	- Use cpu_level_supported()
-	- If you won't use any of the type conversion functions you can use cpu_supported()
+	- Use cpu_supported()
 
 Runtime detection notes:
 Visual studio will support compiling all types and switching at runtime. However this often results in slower
@@ -73,9 +73,13 @@ I've included FallbackFloat64 for use with Emscripen, but use SimdNativeFloat64 
 #include "environment.h"
 #include "simd-cpuid.h"
 #include "simd-concepts.h"
+#include "simd-mask.h"
+#include "simd-uint64.h"
+#include "simd-wasm-helpers.h"
 
 
 #include <cmath>
+#include <cstring>
 
 
 
@@ -102,28 +106,13 @@ struct FallbackFloat64 {
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same the same level may not be supported) 
 	static bool cpu_supported() { return true; }
 
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported() { return true; }
-
-
-#if defined(_M_X64) || defined(__x86_64)
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same the same level may not be supported) 
 	static bool cpu_supported(CpuInformation) { return true; }
-
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported(CpuInformation ) { return true; }
-#endif
 
 	//Performs a compile time CPU check to see if this type is supported.  Checks this type ONLY (integers in same the same level may not be supported) 
 	static constexpr bool compiler_supported() {
 		return true;
 	}
-
-	//Performs a compile time supprot to see if the microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static constexpr bool compiler_level_supported() {
-		return true;
-	}
-	
 
 	//*****Access Elements*****
 	F element(int) const { return v; }
@@ -188,7 +177,7 @@ inline static FallbackFloat64 operator*(double lhs, FallbackFloat64 rhs) noexcep
 //*****Division Operators*****
 inline static FallbackFloat64 operator/(FallbackFloat64  lhs, const FallbackFloat64& rhs) noexcept { lhs /= rhs;	return lhs; }
 inline static FallbackFloat64 operator/(FallbackFloat64  lhs, double rhs) noexcept { lhs /= rhs; return lhs; }
-inline static FallbackFloat64 operator/(const double lhs, const FallbackFloat64& rhs) noexcept { return FallbackFloat64(lhs - rhs.v); }
+inline static FallbackFloat64 operator/(const double lhs, const FallbackFloat64& rhs) noexcept { return FallbackFloat64(lhs / rhs.v); }
 
 //*****Fused Multiply Add Fallbacks*****
 // Fused Multiply Add (a*b+c)
@@ -228,7 +217,7 @@ inline static FallbackFloat64 min(FallbackFloat64 a, FallbackFloat64 b) { return
 inline static FallbackFloat64 max(FallbackFloat64 a, FallbackFloat64 b) { return FallbackFloat64(std::max(a.v, b.v)); }
 
 //*****Approximate Functions*****
-inline static FallbackFloat64 reciprocal_approx(FallbackFloat64 a) { return FallbackFloat64(1.0f / a.v); }
+inline static FallbackFloat64 reciprocal_approx(FallbackFloat64 a) { return FallbackFloat64(1.0 / a.v); }
 
 //*****Mathematical Functions*****
 inline static FallbackFloat64 sqrt(FallbackFloat64 a) { return FallbackFloat64(std::sqrt(a.v)); }
@@ -304,8 +293,259 @@ inline static FallbackFloat64 blend(const FallbackFloat64 if_false, const Fallba
 
 
 //***************** x86_64 only code ******************
-#if defined(_M_X64) || defined(__x86_64)
+#if MT_SIMD_ARCH_X64
 #include <immintrin.h>
+
+
+/**************************************************************************************************
+ * Compiler Compatability Layer
+ * MSCV intrinsics are sometime a little more feature rich than GCC and Clang.  
+ * This section provides shims and patches for compiler incompatible behaviour.
+ * ************************************************************************************************/
+
+namespace mt::simd_detail_f64 {
+	// Portability layer: GCC/Clang cannot index SIMD lanes via MSVC vector members.
+	inline double lane_get(__m128d v, int i) noexcept {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		return v.m128d_f64[i];
+#else
+		alignas(16) double lanes[2];
+		_mm_storeu_pd(lanes, v);
+		return lanes[i];
+#endif
+	}
+	inline __m128d lane_set(__m128d v, int i, double value) noexcept {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		v.m128d_f64[i] = value;
+		return v;
+#else
+		alignas(16) double lanes[2];
+		_mm_storeu_pd(lanes, v);
+		lanes[i] = value;
+		return _mm_loadu_pd(lanes);
+#endif
+	}
+	inline double lane_get(const __m256d& v, int i) noexcept {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		return v.m256d_f64[i];
+#else
+		alignas(32) double lanes[4];
+		_mm256_storeu_pd(lanes, v);
+		return lanes[i];
+#endif
+	}
+	inline void lane_set(__m256d& v, int i, double value) noexcept {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		v.m256d_f64[i] = value;
+#else
+		alignas(32) double lanes[4];
+		_mm256_storeu_pd(lanes, v);
+		lanes[i] = value;
+		v = _mm256_loadu_pd(lanes);
+#endif
+	}
+	inline double lane_get(const __m512d& v, int i) noexcept {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		return v.m512d_f64[i];
+#else
+		alignas(64) double lanes[8];
+		std::memcpy(lanes, &v, sizeof(v));
+		return lanes[i];
+#endif
+	}
+	inline void lane_set(__m512d& v, int i, double value) noexcept {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		v.m512d_f64[i] = value;
+#else
+		alignas(64) double lanes[8];
+		std::memcpy(lanes, &v, sizeof(v));
+		lanes[i] = value;
+		std::memcpy(&v, lanes, sizeof(v));
+#endif
+	}
+
+#if MT_SIMD_USE_PORTABLE_X86_SHIMS
+	template <typename Fn>
+	inline __m128d map_unary(__m128d v, Fn fn) {
+		alignas(16) double in[2], out[2];
+		_mm_storeu_pd(in, v);
+		for (int i = 0; i < 2; ++i) out[i] = fn(in[i]);
+		return _mm_loadu_pd(out);
+	}
+	template <typename Fn>
+	inline __m256d map_unary(const __m256d& v, Fn fn) {
+		alignas(32) double in[4], out[4];
+		_mm256_storeu_pd(in, v);
+		for (int i = 0; i < 4; ++i) out[i] = fn(in[i]);
+		return _mm256_loadu_pd(out);
+	}
+	template <typename Fn>
+	inline __m512d map_unary(const __m512d& v, Fn fn) {
+		alignas(64) double in[8], out[8];
+		std::memcpy(in, &v, sizeof(v));
+		for (int i = 0; i < 8; ++i) out[i] = fn(in[i]);
+		__m512d out_v;
+		std::memcpy(&out_v, out, sizeof(out_v));
+		return out_v;
+	}
+	template <typename Fn>
+	inline __m128d map_binary(__m128d a, __m128d b, Fn fn) {
+		alignas(16) double lhs[2], rhs[2], out[2];
+		_mm_storeu_pd(lhs, a); _mm_storeu_pd(rhs, b);
+		for (int i = 0; i < 2; ++i) out[i] = fn(lhs[i], rhs[i]);
+		return _mm_loadu_pd(out);
+	}
+	template <typename Fn>
+	inline __m256d map_binary(const __m256d& a, const __m256d& b, Fn fn) {
+		alignas(32) double lhs[4], rhs[4], out[4];
+		_mm256_storeu_pd(lhs, a); _mm256_storeu_pd(rhs, b);
+		for (int i = 0; i < 4; ++i) out[i] = fn(lhs[i], rhs[i]);
+		return _mm256_loadu_pd(out);
+	}
+	template <typename Fn>
+	inline __m512d map_binary(const __m512d& a, const __m512d& b, Fn fn) {
+		alignas(64) double lhs[8], rhs[8], out[8];
+		std::memcpy(lhs, &a, sizeof(a));
+		std::memcpy(rhs, &b, sizeof(b));
+		for (int i = 0; i < 8; ++i) out[i] = fn(lhs[i], rhs[i]);
+		__m512d out_v;
+		std::memcpy(&out_v, out, sizeof(out_v));
+		return out_v;
+	}
+#endif
+
+#if MT_SIMD_USE_PORTABLE_X86_SHIMS && !MT_USE_SVML
+	#define MT_F64_UNARY(name, expr) \
+		inline __m128d name##_pd(__m128d v) { return map_unary(v, [](double x) { return (expr); }); } \
+		inline __m256d name##_pd(__m256d v) { return map_unary(v, [](double x) { return (expr); }); } \
+		inline __m512d name##_pd(__m512d v) { return map_unary(v, [](double x) { return (expr); }); }
+
+	#define MT_F64_BINARY(name, expr) \
+		inline __m128d name##_pd(__m128d a, __m128d b) { return map_binary(a, b, [](double x, double y) { return (expr); }); } \
+		inline __m256d name##_pd(__m256d a, __m256d b) { return map_binary(a, b, [](double x, double y) { return (expr); }); } \
+		inline __m512d name##_pd(__m512d a, __m512d b) { return map_binary(a, b, [](double x, double y) { return (expr); }); }
+
+	MT_F64_UNARY(trunc, std::trunc(x))
+	MT_F64_UNARY(round, std::round(x))
+	MT_F64_UNARY(floor, std::floor(x))
+	MT_F64_UNARY(ceil, std::ceil(x))
+	MT_F64_UNARY(exp, std::exp(x))
+	MT_F64_UNARY(exp2, std::exp2(x))
+	MT_F64_UNARY(exp10, std::pow(10.0, x))
+	MT_F64_UNARY(expm1, std::expm1(x))
+	MT_F64_UNARY(log, std::log(x))
+	MT_F64_UNARY(log1p, std::log1p(x))
+	MT_F64_UNARY(log2, std::log2(x))
+	MT_F64_UNARY(log10, std::log10(x))
+	MT_F64_UNARY(cbrt, std::cbrt(x))
+	MT_F64_UNARY(sin, std::sin(x))
+	MT_F64_UNARY(cos, std::cos(x))
+	MT_F64_UNARY(tan, std::tan(x))
+	MT_F64_UNARY(asin, std::asin(x))
+	MT_F64_UNARY(acos, std::acos(x))
+	MT_F64_UNARY(atan, std::atan(x))
+	MT_F64_UNARY(sinh, std::sinh(x))
+	MT_F64_UNARY(cosh, std::cosh(x))
+	MT_F64_UNARY(tanh, std::tanh(x))
+	MT_F64_UNARY(asinh, std::asinh(x))
+	MT_F64_UNARY(acosh, std::acosh(x))
+	MT_F64_UNARY(atanh, std::atanh(x))
+	MT_F64_UNARY(sind, std::sin(x * (3.14159265358979323846 / 180.0)))
+	MT_F64_UNARY(cosd, std::cos(x * (3.14159265358979323846 / 180.0)))
+	MT_F64_UNARY(tand, std::tan(x * (3.14159265358979323846 / 180.0)))
+	MT_F64_BINARY(pow, std::pow(x, y))
+	MT_F64_BINARY(hypot, std::hypot(x, y))
+	MT_F64_BINARY(atan2, std::atan2(x, y))
+
+	#undef MT_F64_UNARY
+	#undef MT_F64_BINARY
+#endif
+
+}
+
+#if MT_SIMD_USE_PORTABLE_X86_SHIMS
+// Portability shim: these math names are not standard hardware intrinsics on GCC/Clang.
+#define _mm_trunc_pd mt::simd_detail_f64::trunc_pd
+#define _mm256_trunc_pd mt::simd_detail_f64::trunc_pd
+#define _mm512_trunc_pd mt::simd_detail_f64::trunc_pd
+#define _mm512_floor_pd mt::simd_detail_f64::floor_pd
+#define _mm512_ceil_pd mt::simd_detail_f64::ceil_pd
+#define _mm_pow_pd mt::simd_detail_f64::pow_pd
+#define _mm256_pow_pd mt::simd_detail_f64::pow_pd
+#define _mm512_pow_pd mt::simd_detail_f64::pow_pd
+#define _mm_exp_pd mt::simd_detail_f64::exp_pd
+#define _mm256_exp_pd mt::simd_detail_f64::exp_pd
+#define _mm512_exp_pd mt::simd_detail_f64::exp_pd
+#define _mm_exp2_pd mt::simd_detail_f64::exp2_pd
+#define _mm256_exp2_pd mt::simd_detail_f64::exp2_pd
+#define _mm512_exp2_pd mt::simd_detail_f64::exp2_pd
+#define _mm_exp10_pd mt::simd_detail_f64::exp10_pd
+#define _mm256_exp10_pd mt::simd_detail_f64::exp10_pd
+#define _mm512_exp10_pd mt::simd_detail_f64::exp10_pd
+#define _mm_expm1_pd mt::simd_detail_f64::expm1_pd
+#define _mm256_expm1_pd mt::simd_detail_f64::expm1_pd
+#define _mm512_expm1_pd mt::simd_detail_f64::expm1_pd
+#define _mm_log_pd mt::simd_detail_f64::log_pd
+#define _mm256_log_pd mt::simd_detail_f64::log_pd
+#define _mm512_log_pd mt::simd_detail_f64::log_pd
+#define _mm_log1p_pd mt::simd_detail_f64::log1p_pd
+#define _mm256_log1p_pd mt::simd_detail_f64::log1p_pd
+#define _mm512_log1p_pd mt::simd_detail_f64::log1p_pd
+#define _mm_log2_pd mt::simd_detail_f64::log2_pd
+#define _mm256_log2_pd mt::simd_detail_f64::log2_pd
+#define _mm512_log2_pd mt::simd_detail_f64::log2_pd
+#define _mm_log10_pd mt::simd_detail_f64::log10_pd
+#define _mm256_log10_pd mt::simd_detail_f64::log10_pd
+#define _mm512_log10_pd mt::simd_detail_f64::log10_pd
+#define _mm_cbrt_pd mt::simd_detail_f64::cbrt_pd
+#define _mm256_cbrt_pd mt::simd_detail_f64::cbrt_pd
+#define _mm512_cbrt_pd mt::simd_detail_f64::cbrt_pd
+#define _mm_hypot_pd mt::simd_detail_f64::hypot_pd
+#define _mm256_hypot_pd mt::simd_detail_f64::hypot_pd
+#define _mm512_hypot_pd mt::simd_detail_f64::hypot_pd
+#define _mm_sin_pd mt::simd_detail_f64::sin_pd
+#define _mm256_sin_pd mt::simd_detail_f64::sin_pd
+#define _mm512_sin_pd mt::simd_detail_f64::sin_pd
+#define _mm_cos_pd mt::simd_detail_f64::cos_pd
+#define _mm256_cos_pd mt::simd_detail_f64::cos_pd
+#define _mm512_cos_pd mt::simd_detail_f64::cos_pd
+#define _mm_tan_pd mt::simd_detail_f64::tan_pd
+#define _mm256_tan_pd mt::simd_detail_f64::tan_pd
+#define _mm512_tan_pd mt::simd_detail_f64::tan_pd
+#define _mm_asin_pd mt::simd_detail_f64::asin_pd
+#define _mm256_asin_pd mt::simd_detail_f64::asin_pd
+#define _mm512_asin_pd mt::simd_detail_f64::asin_pd
+#define _mm_acos_pd mt::simd_detail_f64::acos_pd
+#define _mm256_acos_pd mt::simd_detail_f64::acos_pd
+#define _mm512_acos_pd mt::simd_detail_f64::acos_pd
+#define _mm_atan_pd mt::simd_detail_f64::atan_pd
+#define _mm256_atan_pd mt::simd_detail_f64::atan_pd
+#define _mm512_atan_pd mt::simd_detail_f64::atan_pd
+#define _mm_atan2_pd mt::simd_detail_f64::atan2_pd
+#define _mm256_atan2_pd mt::simd_detail_f64::atan2_pd
+#define _mm512_atan2_pd mt::simd_detail_f64::atan2_pd
+#define _mm_sinh_pd mt::simd_detail_f64::sinh_pd
+#define _mm256_sinh_pd mt::simd_detail_f64::sinh_pd
+#define _mm512_sinh_pd mt::simd_detail_f64::sinh_pd
+#define _mm_cosh_pd mt::simd_detail_f64::cosh_pd
+#define _mm256_cosh_pd mt::simd_detail_f64::cosh_pd
+#define _mm512_cosh_pd mt::simd_detail_f64::cosh_pd
+#define _mm_tanh_pd mt::simd_detail_f64::tanh_pd
+#define _mm256_tanh_pd mt::simd_detail_f64::tanh_pd
+#define _mm512_tanh_pd mt::simd_detail_f64::tanh_pd
+#define _mm_asinh_pd mt::simd_detail_f64::asinh_pd
+#define _mm256_asinh_pd mt::simd_detail_f64::asinh_pd
+#define _mm512_asinh_pd mt::simd_detail_f64::asinh_pd
+#define _mm_acosh_pd mt::simd_detail_f64::acosh_pd
+#define _mm256_acosh_pd mt::simd_detail_f64::acosh_pd
+#define _mm512_acosh_pd mt::simd_detail_f64::acosh_pd
+#define _mm_atanh_pd mt::simd_detail_f64::atanh_pd
+#define _mm256_atanh_pd mt::simd_detail_f64::atanh_pd
+#define _mm512_atanh_pd mt::simd_detail_f64::atanh_pd
+#define _mm_sind_pd mt::simd_detail_f64::sind_pd
+#define _mm_cosd_pd mt::simd_detail_f64::cosd_pd
+#define _mm_tand_pd mt::simd_detail_f64::tand_pd
+#endif
 
 
 
@@ -313,13 +553,13 @@ inline static FallbackFloat64 blend(const FallbackFloat64 if_false, const Fallba
  * SIMD 512 type.  Contains 16 x 64bit Floats
  * Requires AVX-512F support.
  * **************************************************************************************************************************************************************************************************/
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 struct Simd512Float64 {
 	__m512d v;
-	typedef __mmask16 MaskType;
+	typedef __mmask8 MaskType;
 	typedef double F;	
 	typedef Simd512UInt64 U;
-	typedef Simd512UInt64 U64;
-	
+	typedef Simd512UInt64 U64;		//The type of a 64-bit unsigned int.
 
 	Simd512Float64() = default;
 	Simd512Float64(__m512d a) : v(a) {};
@@ -330,44 +570,42 @@ struct Simd512Float64 {
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same class may not be supported) 
 	static bool cpu_supported() {
 		CpuInformation cpuid{};
-		cpu_supported(cpuid);
+		return cpu_supported(cpuid);
 	}
 
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same class may not be supported) 
 	static bool cpu_supported(CpuInformation cpuid) {
-		return cpuid.has_avx512_f();
-	}
-
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported() {
-		CpuInformation cpuid{};
-		cpu_level_supported(cpuid);
-	}
-
-
-
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported(CpuInformation cpuid) {
-		return cpuid.has_avx512_f() && cpuid.has_avx512_dq() && cpuid.has_avx512_vl() && cpuid.has_avx512_bw() && cpuid.has_avx512_cd();
+		return cpuid.is_level_4();
 	}
 
 	//Performs a compile time support. Checks this type ONLY (integers in same class may not be supported) 
 	static constexpr bool compiler_supported() {
-		return mt::environment::compiler_has_avx512f;
+		return mt::environment::compiler_can_use_x86_64_level_4_types;
 	}
-
-	//Performs a compile time supprot to see if the microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static constexpr bool compiler_level_supported() {
-		return mt::environment::compiler_has_avx512f && mt::environment::compiler_has_avx512dq && mt::environment::compiler_has_avx512vl && mt::environment::compiler_has_avx512bw && mt::environment::compiler_has_avx512cd;
-	}
-
 
 	static constexpr int size_of_element() { return sizeof(double); }
 	static constexpr int number_of_elements() { return 8; }
 
 	//*****Access Elements*****
-	F element(int i) const { return v.m512d_f64[i]; }
-	void set_element(int i, F value) { v.m512d_f64[i] = value; }
+	F element(int i) const {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		return mt::simd_detail_f64::lane_get(v, i);
+#else
+		alignas(64) double lanes[8];
+		std::memcpy(lanes, &v, sizeof(v));
+		return lanes[i];
+#endif
+	}
+	void set_element(int i, F value) {
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
+		mt::simd_detail_f64::lane_set(v, i, value);
+#else
+		alignas(64) double lanes[8];
+		std::memcpy(lanes, &v, sizeof(v));
+		lanes[i] = value;
+		std::memcpy(&v, lanes, sizeof(v));
+#endif
+	}
 
 	//*****Addition Operators*****
 	Simd512Float64& operator+=(const Simd512Float64& rhs) noexcept { v = _mm512_add_pd(v, rhs.v); return *this; }
@@ -588,20 +826,18 @@ inline static Simd512Float64 blend(const Simd512Float64 if_false, const Simd512F
 	return Simd512Float64(_mm512_mask_blend_pd(mask, if_false.v, if_true.v));
 }
 
-/*
-inline static bool test_all_false(__mmask8 mask) {
-	
-	//return _mm512_testz_pd(mask, mask);
-}
-inline static bool test_all_true(__mmask8 mask) {
-	//return _mm512_testc_pd(mask, _mm512_set1_pd(std::bit_cast<double>(0xFFFFFFFFFFFFFFFF)));
-}
-*/
+
+/*inline static bool test_all_true(__m256d mask) {
+	return _mm256_testc_pd(mask, _mm256_set1_pd(std::bit_cast<double>(0xFFFFFFFFFFFFFFFF)));
+}*/
 
 /**************************************************************************************************
  * SIMD 256 type.  Contains 8 x 64bit Floats
  * Requires AVX support.
  * ************************************************************************************************/
+#endif // MT_SIMD_ALLOW_LEVEL4_TYPES
+
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 struct Simd256Float64 {
 	__m256d v;
 
@@ -619,41 +855,24 @@ struct Simd256Float64 {
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same the same level may not be supported) 
 	static bool cpu_supported() {
 		CpuInformation cpuid{};
-		cpu_supported(cpuid);
+		return cpu_supported(cpuid);
 	}
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same the same level may not be supported) 
 	static bool cpu_supported(CpuInformation cpuid) {
-		return cpuid.has_avx() && cpuid.has_fma();
+		return cpuid.is_level_3();
 	}
 
 	//Performs a compile time support. Checks this type ONLY (integers in same class may not be supported) 
 	static constexpr bool compiler_supported() {
-		return mt::environment::compiler_has_avx && mt::environment::compiler_has_fma;
+		return mt::environment::compiler_can_use_x86_64_level_3_types;
 	}
-
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported() {
-		CpuInformation cpuid{};
-		cpu_level_supported(cpuid);
-	}
-
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported(CpuInformation cpuid) {
-		return cpuid.has_avx2() && cpuid.has_avx() && cpuid.has_fma();
-	}
-
-	//Performs a compile time support to see if the microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static constexpr bool compiler_level_supported() {
-		return mt::environment::compiler_has_avx2 && mt::environment::compiler_has_avx && mt::environment::compiler_has_fma;
-	}
-
 
 	static constexpr int size_of_element() { return sizeof(double); }
 	static constexpr int number_of_elements() { return 4; }
 
 	//*****Access Elements*****
-	F element(int i) const { return v.m256d_f64[i]; }
-	void set_element(int i, F value) { v.m256d_f64[i] = value; }
+	F element(int i) const { return mt::simd_detail_f64::lane_get(v, i); }
+	void set_element(int i, F value) { mt::simd_detail_f64::lane_set(v, i, value); }
 
 	//*****Addition Operators*****
 	Simd256Float64& operator+=(const Simd256Float64& rhs) noexcept { v = _mm256_add_pd(v, rhs.v); return *this; }
@@ -759,7 +978,14 @@ inline static Simd256Float64 max(Simd256Float64 a, Simd256Float64 b) { return Si
 
 
 //*****Approximate Functions*****
-inline static Simd256Float64 reciprocal_approx(Simd256Float64 a) { return Simd256Float64(1.0 / a); } //No AVX for packed doubles.
+inline static Simd256Float64 reciprocal_approx(Simd256Float64 a) {
+	if constexpr (mt::environment::compiler_has_avx512f && mt::environment::compiler_has_avx512vl) {
+		return Simd256Float64(_mm256_rcp14_pd(a.v));
+	}
+	else {
+		return Simd256Float64(1.0 / a);
+	}
+}
 
 
 
@@ -824,7 +1050,7 @@ inline static Simd256Float64 asinh(Simd256Float64 a) { return Simd256Float64(_mm
 inline static Simd256Float64 acosh(Simd256Float64 a) { return Simd256Float64(_mm256_acosh_pd(a.v)); }
 inline static Simd256Float64 atanh(Simd256Float64 a) { return Simd256Float64(_mm256_atanh_pd(a.v)); }
 inline static Simd256Float64 abs(Simd256Float64 a) {
-	auto r = _mm256_and_pd(_mm256_set1_pd(std::bit_cast<float>(0x7FFFFFFF)), a.v); //No AVX for abs
+	auto r = _mm256_and_pd(_mm256_set1_pd(std::bit_cast<double>(0x7FFFFFFFFFFFFFFFull)), a.v); //No AVX for abs
 	return Simd256Float64(r);
 }
 
@@ -868,13 +1094,6 @@ inline static Simd256Float64 blend(const Simd256Float64 if_false, const Simd256F
 	return Simd256Float64(_mm256_blendv_pd(if_false.v, if_true.v, mask));
 }
 
-inline static bool test_all_false(__m256d mask) {
-	return _mm256_testz_pd(mask, mask);
-}
-inline static bool test_all_true(__m256d mask) {
-	return _mm256_testc_pd(mask, _mm256_set1_pd(std::bit_cast<double>(0xFFFFFFFFFFFFFFFF)));
-}
-
 
 
 /***************************************************************************************************************************************************************************************************
@@ -882,6 +1101,8 @@ inline static bool test_all_true(__m256d mask) {
  * Requires SSE2 support.  
  
  * *************************************************************************************************************************************************************************************************/
+#endif // MT_SIMD_ALLOW_LEVEL3_TYPES
+
 struct Simd128Float64 {
 	__m128d v;
 	typedef double F;
@@ -900,42 +1121,25 @@ struct Simd128Float64 {
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same the same level may not be supported) 
 	static bool cpu_supported() {
 		CpuInformation cpuid{};
-		cpu_supported(cpuid);
+		return cpu_supported(cpuid);
 	}
 	//Performs a runtime CPU check to see if this type is supported.  Checks this type ONLY (integers in same the same level may not be supported) 
 	static bool cpu_supported(CpuInformation cpuid) {
-		return cpuid.has_sse() && cpuid.has_sse2();
+		return cpuid.is_level_1();
 	}
 
 	//Performs a compile time support. Checks this type ONLY (integers in same class may not be supported) 
 	static constexpr bool compiler_supported() {
-		return mt::environment::compiler_has_sse && mt::environment::compiler_has_sse2;
+		return mt::environment::compiler_can_use_x86_64_level_1_types;
 	}
 
 
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported() {
-		CpuInformation cpuid{};
-		cpu_level_supported(cpuid);
-	}
-
-	//Performs a runtime CPU check to see if this type's microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static bool cpu_level_supported(CpuInformation cpuid) {
-		return cpuid.has_sse() && cpuid.has_sse2() ;
-	}
-
-	//Performs a compile time support to see if the microarchitecture level is supported.  (This will ensure that referernced integer types are also supported)
-	static constexpr bool compiler_level_supported() {
-		return mt::environment::compiler_has_sse && mt::environment::compiler_has_sse2;
-	}
-
-
-	static constexpr int size_of_element() { return sizeof(float); }
+	static constexpr int size_of_element() { return sizeof(double); }
 	static constexpr int number_of_elements() { return 2; }
 
 	//*****Access Elements*****
-	F element(int i)  const { return v.m128d_f64[i]; }
-	void set_element(int i, F value) { v.m128d_f64[i] = value; }
+	F element(int i)  const { return mt::simd_detail_f64::lane_get(v, i); }
+	void set_element(int i, F value) { v = mt::simd_detail_f64::lane_set(v, i, value); }
 
 	//*****Addition Operators*****
 	Simd128Float64& operator+=(const Simd128Float64& rhs) noexcept { v = _mm_add_pd(v, rhs.v); return *this; } //SSE1
@@ -959,6 +1163,7 @@ struct Simd128Float64 {
 
 	//*****Make Functions****
 	static Simd128Float64 make_sequential(F first) { return Simd128Float64(_mm_set_pd(first + 1.0f, first)); }
+	static Simd128Float64 make_set1(F v) { return Simd128Float64(_mm_set1_pd(v)); }
 
 
 	//static Simd128Float64 make_from_int64(Simd128UInt64 i) { return Simd128Float64(_mm_cvtepi64_pd(i.v)); } //SSE2
@@ -999,7 +1204,7 @@ inline static Simd128Float64 floor(Simd128Float64 a) noexcept {
 		return Simd128Float64(_mm_floor_pd(a.v)); //SSE4.1
 	}
 	else {
-		return Simd128Float64(_mm_set_pd(std::floor(a.v.m128d_f64[1]), std::floor(a.v.m128d_f64[0])));
+		return Simd128Float64(_mm_set_pd(std::floor(a.element(1)), std::floor(a.element(0))));
 	}
 }
 
@@ -1009,12 +1214,19 @@ inline static Simd128Float64 ceil(Simd128Float64 a) noexcept {
 		return Simd128Float64(_mm_ceil_pd(a.v)); //SSE4.1
 	}
 	else {
-		return Simd128Float64(_mm_set_pd( std::ceil(a.v.m128d_f64[1]), std::ceil(a.v.m128d_f64[0])));
+		return Simd128Float64(_mm_set_pd( std::ceil(a.element(1)), std::ceil(a.element(0))));
 	}
 }
 
 [[nodiscard("Value calculated and not used (trunc)")]]
-inline static Simd128Float64 trunc(Simd128Float64 a) noexcept { return Simd128Float64(_mm_trunc_pd(a.v)); } //SSE1
+inline static Simd128Float64 trunc(Simd128Float64 a) noexcept {
+	if constexpr (mt::environment::compiler_has_sse4_1) {
+		return Simd128Float64(_mm_round_pd(a.v, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC)); //SSE4.1
+	}
+	else {
+		return Simd128Float64(_mm_set_pd(std::trunc(a.element(1)), std::trunc(a.element(0))));
+	}
+}
 
 [[nodiscard("Value calculated and not used (round)")]]
 inline static Simd128Float64 round(Simd128Float64 a) noexcept {
@@ -1022,7 +1234,7 @@ inline static Simd128Float64 round(Simd128Float64 a) noexcept {
 		return Simd128Float64(_mm_round_pd(a.v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)); //SSE4.1
 	}
 	else {
-		return Simd128Float64(_mm_set_pd( std::round(a.v.m128d_f64[1]), std::round(a.v.m128d_f64[0])));
+		return Simd128Float64(_mm_set_pd( std::round(a.element(1)), std::round(a.element(0))));
 	}
 }
 
@@ -1036,44 +1248,56 @@ inline static Simd128Float64 fract(Simd128Float64 a) noexcept { return a - floor
 // Fused Multiply Add (a*b+c)
 [[nodiscard("Value calculated and not used (fma)")]]
 inline static Simd128Float64 fma(const Simd128Float64  a, const Simd128Float64 b, const Simd128Float64 c) {
-	if constexpr (mt::environment::compiler_has_avx2) {
+	if constexpr (mt::environment::compiler_has_fma) {
 		return _mm_fmadd_pd(a.v, b.v, c.v);  //We are compiling to level 3, but using 128 simd.
 	}
 	else {
-		return a * b + c;  //Fallback (no SSE instruction)
+		return Simd128Float64(_mm_set_pd(
+			std::fma(a.element(1), b.element(1), c.element(1)),
+			std::fma(a.element(0), b.element(0), c.element(0))
+		));
 	}
 }
 
 // Fused Multiply Subtract (a*b-c)
 [[nodiscard("Value calculated and not used (fms)")]]
 inline static Simd128Float64 fms(const Simd128Float64  a, const Simd128Float64 b, const Simd128Float64 c) {
-	if constexpr (mt::environment::compiler_has_avx2) {
+	if constexpr (mt::environment::compiler_has_fma) {
 		return _mm_fmsub_pd(a.v, b.v, c.v);  //We are compiling to level 3, but using 128 simd.
 	}
 	else {
-		return a * b - c;  //Fallback (no SSE instruction)
+		return Simd128Float64(_mm_set_pd(
+			std::fma(a.element(1), b.element(1), -c.element(1)),
+			std::fma(a.element(0), b.element(0), -c.element(0))
+		));
 	}
 }
 
 // Fused Negative Multiply Add (-a*b+c)
 [[nodiscard("Value calculated and not used (fnma)")]]
 inline static Simd128Float64 fnma(const Simd128Float64  a, const Simd128Float64 b, const Simd128Float64 c) {
-	if constexpr (mt::environment::compiler_has_avx2) {
+	if constexpr (mt::environment::compiler_has_fma) {
 		return _mm_fnmadd_pd(a.v, b.v, c.v);  //We are compiling to level 3, but using 128 simd.
 	}
 	else {
-		return -a * b + c;  //Fallback (no SSE instruction)
+		return Simd128Float64(_mm_set_pd(
+			std::fma(-a.element(1), b.element(1), c.element(1)),
+			std::fma(-a.element(0), b.element(0), c.element(0))
+		));
 	}
 }
 
 // Fused Negative Multiply Subtract (-a*b-c)
 [[nodiscard("Value calculated and not used (fnms)")]]
 inline static Simd128Float64 fnms(const Simd128Float64  a, const Simd128Float64 b, const Simd128Float64 c) {
-	if constexpr (mt::environment::compiler_has_avx2) {
+	if constexpr (mt::environment::compiler_has_fma) {
 		return _mm_fnmsub_pd(a.v, b.v, c.v); //We are compiling to level 3, but using 128 simd.
 	}
 	else {
-		return -a * b - c;  //Fallback (no SSE instruction)
+		return Simd128Float64(_mm_set_pd(
+			std::fma(-a.element(1), b.element(1), -c.element(1)),
+			std::fma(-a.element(0), b.element(0), -c.element(0))
+		));
 	}
 }
 
@@ -1112,7 +1336,14 @@ inline static Simd128Float64 clamp(const Simd128Float64 a, const float min_f, co
 
 //*****Approximate Functions*****
 [[nodiscard("Value calculated and not used (reciprocal_approx)")]]
-inline static Simd128Float64 reciprocal_approx(const Simd128Float64 a) noexcept { return Simd128Float64(1.0/a.v); }
+inline static Simd128Float64 reciprocal_approx(const Simd128Float64 a) noexcept {
+	if constexpr (mt::environment::compiler_has_avx512f && mt::environment::compiler_has_avx512vl) {
+		return Simd128Float64(_mm_rcp14_pd(a.v));
+	}
+	else {
+		return Simd128Float64(1.0 / a.v);
+	}
+}
 
 //*****128-bit Mathematical Functions*****
 [[nodiscard("Value calculated and not used (sqrt)")]]
@@ -1121,7 +1352,7 @@ inline static Simd128Float64 sqrt(const Simd128Float64 a) noexcept { return Simd
 [[nodiscard("Value Calculated and not used (abs)")]]
 inline static Simd128Float64 abs(const Simd128Float64 a) noexcept {
 	//No SSE for abs so we just flip the bit.
-	const auto r = _mm_and_pd(_mm_set1_pd(std::bit_cast<float>(0x7FFFFFFF)), a.v);
+	const auto r = _mm_and_pd(_mm_set1_pd(std::bit_cast<double>(0x7FFFFFFFFFFFFFFFull)), a.v);
 	return Simd128Float64(r);
 }
 //Calculating a raised to the power of b
@@ -1245,13 +1476,200 @@ inline static Simd128Float64 blend(const Simd128Float64 if_false, const Simd128F
 	}
 }
 
-inline static bool test_all_false(__m128d mask) {
-	return _mm_testz_pd(mask, mask);
+
+
+
+#elif MT_SIMD_ARCH_WASM && defined(__wasm_simd128__)
+
+struct Simd128Float64 {
+	v128_t v;
+
+	typedef double F;
+	typedef v128_t MaskType;
+	typedef Simd128UInt32 U;
+	typedef Simd128UInt64 U64;
+
+	Simd128Float64() = default;
+	Simd128Float64(v128_t a) : v(a) {}
+	Simd128Float64(F a) : v(mt::simd_wasm_detail::splat<double>(a)) {}
+
+	static bool cpu_supported() {
+		CpuInformation cpuid{};
+		return cpu_supported(cpuid);
+	}
+	static bool cpu_supported(CpuInformation cpuid) {
+		return cpuid.has_wasm_simd();
+	}
+	static constexpr bool compiler_supported() {
+		return mt::environment::is_wasm_simd_level_1;
+	}
+
+	static constexpr int size_of_element() { return sizeof(double); }
+	static constexpr int number_of_elements() { return 2; }
+
+	F element(int i) const { return mt::simd_wasm_detail::lane_get<double, 2>(v, i); }
+	void set_element(int i, F value) { v = mt::simd_wasm_detail::lane_set<double, 2>(v, i, value); }
+
+	Simd128Float64& operator+=(const Simd128Float64& rhs) noexcept { v = wasm_f64x2_add(v, rhs.v); return *this; }
+	Simd128Float64& operator+=(double rhs) noexcept { v = wasm_f64x2_add(v, Simd128Float64(rhs).v); return *this; }
+	Simd128Float64& operator-=(const Simd128Float64& rhs) noexcept { v = wasm_f64x2_sub(v, rhs.v); return *this; }
+	Simd128Float64& operator-=(double rhs) noexcept { v = wasm_f64x2_sub(v, Simd128Float64(rhs).v); return *this; }
+	Simd128Float64& operator*=(const Simd128Float64& rhs) noexcept { v = wasm_f64x2_mul(v, rhs.v); return *this; }
+	Simd128Float64& operator*=(double rhs) noexcept { v = wasm_f64x2_mul(v, Simd128Float64(rhs).v); return *this; }
+	Simd128Float64& operator/=(const Simd128Float64& rhs) noexcept { v = wasm_f64x2_div(v, rhs.v); return *this; }
+	Simd128Float64& operator/=(double rhs) noexcept { v = wasm_f64x2_div(v, Simd128Float64(rhs).v); return *this; }
+	Simd128Float64 operator-() const noexcept { return Simd128Float64(wasm_f64x2_neg(v)); }
+
+	static Simd128Float64 make_sequential(F first) { return Simd128Float64(mt::simd_wasm_detail::make_sequential<double, 2>(first)); }
+	static Simd128Float64 make_set1(F value) { return Simd128Float64(mt::simd_wasm_detail::splat<double>(value)); }
+	static Simd128Float64 make_from_uints_52bits(Simd128UInt64 i) {
+		auto lanes = mt::simd_wasm_detail::to_array<std::uint64_t, 2>(i.v);
+		std::array<double, 2> converted{};
+		for (std::size_t lane = 0; lane < converted.size(); ++lane) {
+			converted[lane] = static_cast<double>(lanes[lane] & 0x000FFFFFFFFFFFFFULL);
+		}
+		return Simd128Float64(mt::simd_wasm_detail::from_array<double, 2>(converted));
+	}
+
+	Simd128UInt64 bitcast_to_uint() const { return Simd128UInt64(v); }
+};
+
+inline static Simd128Float64 operator+(Simd128Float64 lhs, const Simd128Float64& rhs) noexcept { lhs += rhs; return lhs; }
+inline static Simd128Float64 operator+(Simd128Float64 lhs, double rhs) noexcept { lhs += rhs; return lhs; }
+inline static Simd128Float64 operator+(double lhs, Simd128Float64 rhs) noexcept { rhs += lhs; return rhs; }
+inline static Simd128Float64 operator-(Simd128Float64 lhs, const Simd128Float64& rhs) noexcept { lhs -= rhs; return lhs; }
+inline static Simd128Float64 operator-(Simd128Float64 lhs, double rhs) noexcept { lhs -= rhs; return lhs; }
+inline static Simd128Float64 operator-(const double lhs, const Simd128Float64& rhs) noexcept { return Simd128Float64(lhs) - rhs; }
+inline static Simd128Float64 operator*(Simd128Float64 lhs, const Simd128Float64& rhs) noexcept { lhs *= rhs; return lhs; }
+inline static Simd128Float64 operator*(Simd128Float64 lhs, double rhs) noexcept { lhs *= rhs; return lhs; }
+inline static Simd128Float64 operator*(double lhs, Simd128Float64 rhs) noexcept { rhs *= lhs; return rhs; }
+inline static Simd128Float64 operator/(Simd128Float64 lhs, const Simd128Float64& rhs) noexcept { lhs /= rhs; return lhs; }
+inline static Simd128Float64 operator/(Simd128Float64 lhs, double rhs) noexcept { lhs /= rhs; return lhs; }
+inline static Simd128Float64 operator/(const double lhs, const Simd128Float64& rhs) noexcept { return Simd128Float64(lhs) / rhs; }
+
+[[nodiscard("Value calculated and not used (floor)")]]
+inline static Simd128Float64 floor(Simd128Float64 a) noexcept { return Simd128Float64(wasm_f64x2_floor(a.v)); }
+[[nodiscard("Value calculated and not used (ceil)")]]
+inline static Simd128Float64 ceil(Simd128Float64 a) noexcept { return Simd128Float64(wasm_f64x2_ceil(a.v)); }
+[[nodiscard("Value calculated and not used (trunc)")]]
+inline static Simd128Float64 trunc(Simd128Float64 a) noexcept { return Simd128Float64(wasm_f64x2_trunc(a.v)); }
+[[nodiscard("Value calculated and not used (round)")]]
+inline static Simd128Float64 round(Simd128Float64 a) noexcept { return Simd128Float64(wasm_f64x2_nearest(a.v)); }
+[[nodiscard("Value calculated and not used (fract)")]]
+inline static Simd128Float64 fract(Simd128Float64 a) noexcept { return a - floor(a); }
+
+[[nodiscard("Value calculated and not used (fma)")]]
+inline static Simd128Float64 fma(const Simd128Float64 a, const Simd128Float64 b, const Simd128Float64 c) {
+	return Simd128Float64(mt::simd_wasm_detail::map_ternary<double, 2>(a.v, b.v, c.v, [](double x, double y, double z) { return std::fma(x, y, z); }));
 }
-inline static bool test_all_true(__m128d mask) {
-	return _mm_testc_pd(mask, _mm_set1_pd(std::bit_cast<double>(0xFFFFFFFFFFFFFFFF)));
+[[nodiscard("Value calculated and not used (fms)")]]
+inline static Simd128Float64 fms(const Simd128Float64 a, const Simd128Float64 b, const Simd128Float64 c) {
+	return Simd128Float64(mt::simd_wasm_detail::map_ternary<double, 2>(a.v, b.v, c.v, [](double x, double y, double z) { return std::fma(x, y, -z); }));
+}
+[[nodiscard("Value calculated and not used (fnma)")]]
+inline static Simd128Float64 fnma(const Simd128Float64 a, const Simd128Float64 b, const Simd128Float64 c) {
+	return Simd128Float64(mt::simd_wasm_detail::map_ternary<double, 2>(a.v, b.v, c.v, [](double x, double y, double z) { return std::fma(-x, y, z); }));
+}
+[[nodiscard("Value calculated and not used (fnms)")]]
+inline static Simd128Float64 fnms(const Simd128Float64 a, const Simd128Float64 b, const Simd128Float64 c) {
+	return Simd128Float64(mt::simd_wasm_detail::map_ternary<double, 2>(a.v, b.v, c.v, [](double x, double y, double z) { return std::fma(-x, y, -z); }));
 }
 
+[[nodiscard("Value calculated and not used (min)")]]
+inline static Simd128Float64 min(const Simd128Float64 a, const Simd128Float64 b) noexcept { return Simd128Float64(wasm_f64x2_min(a.v, b.v)); }
+[[nodiscard("Value calculated and not used (max)")]]
+inline static Simd128Float64 max(const Simd128Float64 a, const Simd128Float64 b) noexcept { return Simd128Float64(wasm_f64x2_max(a.v, b.v)); }
+[[nodiscard("Value calculated and not used (clamp)")]]
+inline static Simd128Float64 clamp(const Simd128Float64 a) noexcept { return max(Simd128Float64(0.0), min(a, Simd128Float64(1.0))); }
+[[nodiscard("Value calculated and not used (clamp)")]]
+inline static Simd128Float64 clamp(const Simd128Float64 a, const Simd128Float64 min_v, const Simd128Float64 max_v) noexcept {
+	return Simd128Float64(mt::simd_wasm_detail::clamp_vector<double, 2>(a.v, min_v.v, max_v.v));
+}
+[[nodiscard("Value calculated and not used (clamp)")]]
+inline static Simd128Float64 clamp(const Simd128Float64 a, const double min_f, const double max_f) noexcept {
+	return clamp(a, Simd128Float64(min_f), Simd128Float64(max_f));
+}
+[[nodiscard("Value calculated and not used (reciprocal_approx)")]]
+inline static Simd128Float64 reciprocal_approx(const Simd128Float64 a) noexcept {
+	return Simd128Float64(wasm_f64x2_div(Simd128Float64(1.0).v, a.v));
+}
+
+[[nodiscard("Value calculated and not used (sqrt)")]]
+inline static Simd128Float64 sqrt(const Simd128Float64 a) noexcept { return Simd128Float64(wasm_f64x2_sqrt(a.v)); }
+[[nodiscard("Value Calculated and not used (abs)")]]
+inline static Simd128Float64 abs(const Simd128Float64 a) noexcept { return Simd128Float64(wasm_f64x2_abs(a.v)); }
+
+#define MT_WASM_F64_UNARY_STD(name, fn) \
+[[nodiscard("Value calculated and not used (" #name ")")]] \
+inline static Simd128Float64 name(const Simd128Float64 a) noexcept { \
+	return Simd128Float64(mt::simd_wasm_detail::map_unary<double, 2>(a.v, [](double x) { return std::fn(x); })); \
+}
+
+#define MT_WASM_F64_BINARY_STD(name, fn) \
+[[nodiscard("Value calculated and not used (" #name ")")]] \
+inline static Simd128Float64 name(const Simd128Float64 a, const Simd128Float64 b) noexcept { \
+	return Simd128Float64(mt::simd_wasm_detail::map_binary<double, 2>(a.v, b.v, [](double x, double y) { return std::fn(x, y); })); \
+}
+
+MT_WASM_F64_BINARY_STD(pow, pow)
+MT_WASM_F64_UNARY_STD(exp, exp)
+MT_WASM_F64_UNARY_STD(exp2, exp2)
+MT_WASM_F64_UNARY_STD(expm1, expm1)
+MT_WASM_F64_UNARY_STD(log, log)
+MT_WASM_F64_UNARY_STD(log1p, log1p)
+MT_WASM_F64_UNARY_STD(log2, log2)
+MT_WASM_F64_UNARY_STD(log10, log10)
+MT_WASM_F64_UNARY_STD(cbrt, cbrt)
+MT_WASM_F64_BINARY_STD(hypot, hypot)
+MT_WASM_F64_UNARY_STD(sin, sin)
+MT_WASM_F64_UNARY_STD(cos, cos)
+MT_WASM_F64_UNARY_STD(tan, tan)
+MT_WASM_F64_UNARY_STD(asin, asin)
+MT_WASM_F64_UNARY_STD(acos, acos)
+MT_WASM_F64_UNARY_STD(atan, atan)
+MT_WASM_F64_BINARY_STD(atan2, atan2)
+MT_WASM_F64_UNARY_STD(sinh, sinh)
+MT_WASM_F64_UNARY_STD(cosh, cosh)
+MT_WASM_F64_UNARY_STD(tanh, tanh)
+MT_WASM_F64_UNARY_STD(asinh, asinh)
+MT_WASM_F64_UNARY_STD(acosh, acosh)
+MT_WASM_F64_UNARY_STD(atanh, atanh)
+inline static Simd128Float64 exp10(const Simd128Float64 a) noexcept {
+	return Simd128Float64(mt::simd_wasm_detail::map_unary<double, 2>(a.v, [](double x) { return std::pow(10.0, x); }));
+}
+inline static Simd128Float64 sind(const Simd128Float64 a) noexcept {
+	return Simd128Float64(mt::simd_wasm_detail::map_unary<double, 2>(a.v, [](double x) {
+		constexpr double degrees_to_radians = 3.14159265358979323846 / 180.0;
+		return std::sin(x * degrees_to_radians);
+	}));
+}
+inline static Simd128Float64 cosd(const Simd128Float64 a) noexcept {
+	return Simd128Float64(mt::simd_wasm_detail::map_unary<double, 2>(a.v, [](double x) {
+		constexpr double degrees_to_radians = 3.14159265358979323846 / 180.0;
+		return std::cos(x * degrees_to_radians);
+	}));
+}
+inline static Simd128Float64 tand(const Simd128Float64 a) noexcept {
+	return Simd128Float64(mt::simd_wasm_detail::map_unary<double, 2>(a.v, [](double x) {
+		constexpr double degrees_to_radians = 3.14159265358979323846 / 180.0;
+		return std::tan(x * degrees_to_radians);
+	}));
+}
+
+#undef MT_WASM_F64_UNARY_STD
+#undef MT_WASM_F64_BINARY_STD
+
+inline static v128_t compare_equal(const Simd128Float64 a, const Simd128Float64 b) noexcept { return wasm_f64x2_eq(a.v, b.v); }
+inline static v128_t compare_less(const Simd128Float64 a, const Simd128Float64 b) noexcept { return wasm_f64x2_lt(a.v, b.v); }
+inline static v128_t compare_less_equal(const Simd128Float64 a, const Simd128Float64 b) noexcept { return wasm_f64x2_le(a.v, b.v); }
+inline static v128_t compare_greater(const Simd128Float64 a, const Simd128Float64 b) noexcept { return wasm_f64x2_gt(a.v, b.v); }
+inline static v128_t compare_greater_equal(const Simd128Float64 a, const Simd128Float64 b) noexcept { return wasm_f64x2_ge(a.v, b.v); }
+inline static v128_t isnan(const Simd128Float64 a) noexcept { return wasm_f64x2_ne(a.v, a.v); }
+
+[[nodiscard("Value Calculated and not used (blend)")]]
+inline static Simd128Float64 blend(const Simd128Float64 if_false, const Simd128Float64 if_true, v128_t mask) noexcept {
+	return Simd128Float64(wasm_v128_bitselect(if_true.v, if_false.v, mask));
+}
 
 #endif //x86_64
 
@@ -1303,6 +1721,7 @@ inline static T if_nan(const T value_a, const T if_true, const T if_false) noexc
 /**************************************************************************************************
  * MASK OPS
  * ************************************************************************************************/
+#if MT_SIMD_HAS_MSVC_VECTOR_MEMBERS
 inline static __m128d operator&(__m128d  lhs, const __m128d rhs) noexcept { return _mm_and_pd(lhs, rhs); }
 inline static __m128d operator|(__m128d  lhs, const __m128d rhs) noexcept { return _mm_or_pd(lhs, rhs); }
 inline static __m128d operator^(__m128d  lhs, const __m128d rhs) noexcept { return _mm_xor_pd(lhs, rhs); }
@@ -1312,6 +1731,7 @@ inline static __m256d operator&(__m256d  lhs, const __m256d rhs) noexcept { retu
 inline static __m256d operator|(__m256d  lhs, const __m256d rhs) noexcept { return _mm256_or_pd(lhs, rhs); }
 inline static __m256d operator^(__m256d  lhs, const __m256d rhs) noexcept { return _mm256_xor_pd(lhs, rhs); }
 inline static __m256d operator~(__m256d  lhs) noexcept { return _mm256_xor_pd(lhs, _mm256_xor_pd(lhs, _mm256_set1_pd(std::bit_cast<double>(0xFFFFFFFFFFFFFFFF)))); }
+#endif
 
 
 /**************************************************************************************************
@@ -1325,40 +1745,68 @@ static_assert(SimdFloat64<FallbackFloat64>, "FallbackFloat64 does not implement 
 static_assert(SimdMath<FallbackFloat64>, "FallbackFloat64 does not implement the concept SimdFloat64");
 static_assert(SimdCompareOps<FallbackFloat64>, "FallbackFloat64 does not implement the concept SimdCompareOps");
 
-#if defined(_M_X64) || defined(__x86_64)
+#if MT_SIMD_ARCH_X64
 static_assert(Simd<Simd128Float64>, "Simd128Float64 does not implement the concept SIMD");
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 static_assert(Simd<Simd256Float64>, "Simd256Float64 does not implement the concept SIMD");
+#endif
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 static_assert(Simd<Simd512Float64>, "Simd512Float64 does not implement the concept SIMD");
+#endif
 
 //Real
 static_assert(SimdReal<Simd128Float64>, "Simd128Float64 does not implement the concept SimdReal");
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 static_assert(SimdReal<Simd256Float64>, "Simd256Float64 does not implement the concept SimdReal");
+#endif
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 static_assert(SimdReal<Simd512Float64>, "Simd512Float64 does not implement the concept SimdReal");
+#endif
 
 //Float
 static_assert(SimdFloat<Simd128Float64>, "Simd128Float64 does not implement the concept SimdFloat");
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 static_assert(SimdFloat<Simd256Float64>, "Simd256Float64 does not implement the concept SimdFloat");
+#endif
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 static_assert(SimdFloat<Simd512Float64>, "Simd512Float64 does not implement the concept SimdFloat");
+#endif
 
 //Float64
 static_assert(SimdFloat64<Simd128Float64>, "Simd128Float64 does not implement the concept SimdFloat64");
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 static_assert(SimdFloat64<Simd256Float64>, "Simd256Float64 does not implement the concept SimdFloat64");
+#endif
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 static_assert(SimdFloat64<Simd512Float64>, "Simd512Float64 does not implement the concept SimdFloat64");
+#endif
 
 //Uint conversion support.
 static_assert(SimdFloatToInt<Simd128Float64>, "Simd128Float64 does not implement the concept SimdFloatToInt");
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 static_assert(SimdFloatToInt<Simd256Float64>, "Simd256Float64 does not implement the concept SimdFloatToInt");
+#endif
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 static_assert(SimdFloatToInt<Simd512Float64>, "Simd512Float64 does not implement the concept SimdFloatToInt");
+#endif
 
 //SIMD Math Support
 static_assert(SimdMath<Simd128Float64>, "Simd128Float64 does not implement the concept SimdMath");
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 static_assert(SimdMath<Simd256Float64>, "Simd256Float64 does not implement the concept SimdMath");
+#endif
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 static_assert(SimdMath<Simd512Float64>, "Simd512Float64 does not implement the concept SimdMath");
+#endif
 
 //Compare Ops
 static_assert(SimdCompareOps<Simd128Float64>, "Simd128Float64 does not implement the concept SimdCompareOps");
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 static_assert(SimdCompareOps<Simd256Float64>, "Simd256Float64 does not implement the concept SimdCompareOps");
+#endif
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 static_assert(SimdCompareOps<Simd512Float64>, "Simd512Float64 does not implement the concept SimdCompareOps");
+#endif
 
 
 #endif
@@ -1368,11 +1816,11 @@ static_assert(SimdCompareOps<Simd512Float64>, "Simd512Float64 does not implement
  Define SimdNativeFloat64 as the best supported type at compile time.
  (Based on microarchitecture level so that integers are also supported)
 *************************************************************************************************/
-#if defined(_M_X64) || defined(__x86_64)
-	#if defined(__AVX512F__) && defined(__AVX512DQ__) 
+#if MT_SIMD_ARCH_X64
+#if MT_SIMD_ALLOW_LEVEL4_TYPES
 	typedef Simd512Float64 SimdNativeFloat64;
 	#else
-	#if defined(__AVX2__) && defined(__AVX__) 
+#if MT_SIMD_ALLOW_LEVEL3_TYPES
 	typedef Simd256Float64 SimdNativeFloat64;
 	#else
 	#if defined(__SSE4_1__) && defined(__SSE4_1__) && defined(__SSE3__) && defined(__SSSE3__) 
@@ -1382,7 +1830,11 @@ static_assert(SimdCompareOps<Simd512Float64>, "Simd512Float64 does not implement
 	#endif	
 	#endif	
 	#endif
+#elif MT_SIMD_ARCH_WASM && defined(__wasm_simd128__)
+	typedef Simd128Float64 SimdNativeFloat64;
 #else
 	//not x64
 	typedef FallbackFloat64 SimdNativeFloat64;
 #endif
+
+

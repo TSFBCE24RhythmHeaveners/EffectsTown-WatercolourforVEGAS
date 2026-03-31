@@ -41,33 +41,65 @@ Description:
  * 
  * ************************************************************************************************/
 EM_JS (emscripten::EM_VAL, setup_workers, (), {
+    function getLocalWorkerUrl(fileName){
+        return new URL(fileName, self.location.href);
+    }
+
     let offscreen;
     let ctx;
     let backBuffer;
 
     let isPreview=false;
     let seed = "";
+    let renderIsPreview = false;
+    let renderSeed = "";
+    let renderParams = {};
+    let previewWidth = 0;
+    let previewHeight = 0;
+    let activeJobKind = 'preview';
+    let activeExportInfo = undefined;
 
     let workers = [];
     let workerCount = 0;
+    let renderWorkerScript = getLocalWorkerUrl("main-render-worker-cpp.js");
 
     let jobNumber = 0;        /// Current Job (update on resize etc).  Zero indicates not ready.
     let lineNumber = 0;       /// Next line to send to worker for rendering
     let linesRendered=0;      /// Number of lines completed by workers
     let renderStartTime = 0;  /// Timing variable
     let lastBufferSwap=0;     /// Timer variable used to rate limit updating of canvas.
+    let currentParams = {};   /// Latest parameter values received from the GUI thread.
 
-    let numberWorkers = navigator.hardwareConcurrency;
+    let numberWorkers = Number(navigator.hardwareConcurrency) || 4;
+    if (numberWorkers<1) numberWorkers=1;
     if (numberWorkers<4) numberWorkers=4;
     if (numberWorkers>64) numberWorkers=64;  //We start getting memory allocation issues above 80 or so.
 
-    //Setup message handeling.
-    self.onmessage = handelMessageParent;
+    function supportsWasmSimd() {
+        if (typeof WebAssembly !== "object" || typeof WebAssembly.validate !== "function") return false;
+        const simdProbe = new Uint8Array([
+            0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+            0x01,0x04,0x01,0x60,0x00,0x00,
+            0x03,0x02,0x01,0x00,
+            0x0a,0x17,0x01,0x15,0x00,
+            0xfd,0x0c,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x1a,0x0b
+        ]);
+        return WebAssembly.validate(simdProbe);
+    }
+
+    const simdSupported = supportsWasmSimd();
+    renderWorkerScript = simdSupported ? getLocalWorkerUrl("main-render-worker-cpp-simd.js") : getLocalWorkerUrl("main-render-worker-cpp.js");
+    console.log("[www background] WebAssembly SIMD support: " + (simdSupported ? "enabled" : "not available") + "; loading " + renderWorkerScript);
+
+    //Setup message handling.
+    self.onmessage = handleMessageParent;
 
     //Start Render Workers
     for (let i=0; i<numberWorkers; i++){
-        let worker = new Worker("main-render-worker-cpp.js", {name:'render'});
-        worker.onmessage = handelMessageRender;       
+        let worker = new Worker(renderWorkerScript, {name:'render'});
+        worker.onmessage = handleMessageRender;       
     }
 
     //Send loaded message to UI Thread.
@@ -87,8 +119,9 @@ EM_JS (emscripten::EM_VAL, setup_workers, (), {
             'width': offscreen.width,
             'height': offscreen.height,
             'line':lineNumber++,
-            'seed':seed,
-            'isPreview':isPreview,
+            'seed':renderSeed,
+            'isPreview':renderIsPreview,
+            'params': renderParams,
         };
         w.postMessage(msg);
         
@@ -97,18 +130,26 @@ EM_JS (emscripten::EM_VAL, setup_workers, (), {
     /**************************************************************************************************
     * Javascript function:  Perform Render
     * ************************************************************************************************/
-    function doRender(){
-        //At least one worker needs to be started.        
+    function doRender(kind, exportInfo){
+        //At least one worker needs to be started.
         if (workerCount == 0) {
-           setTimeout(doRender, 20);
+           setTimeout(function(){
+                doRender(kind, exportInfo);
+           }, 20);
            return;
         }
+        if (typeof offscreen === 'undefined') return; //Canvas not yet transferred.
         
         renderStartTime = performance.now();
         lastBufferSwap = performance.now();
         jobNumber++;
         lineNumber=0;
         linesRendered=0;
+        renderSeed = seed;
+        renderIsPreview = isPreview;
+        renderParams = currentParams;
+        activeJobKind = kind || 'preview';
+        activeExportInfo = exportInfo;
         
 
         for (let i=0; i< workerCount; i++){
@@ -116,52 +157,115 @@ EM_JS (emscripten::EM_VAL, setup_workers, (), {
         }
 
         //Clear backbuffer
-        for (let i=0;i<backBuffer.data.length;i++) backBuffer.data[i] = 0x0; 
+        backBuffer.data.fill(0);
     }
 
     /**************************************************************************************************
     * Javascript function:  Resize event.
     * A resize event is sent via message from the GUI thread, but we need to resize canvas here.
     * ************************************************************************************************/
-    function resizeCanvas(width,height){
+    function resizeCanvas(width,height, kind, exportInfo){
         
-        ctx.width = offscreen.width = width;
-        ctx.height = offscreen.height = height;
+        offscreen.width = width;
+        offscreen.height = height;
         backBuffer = new ImageData(offscreen.width,offscreen.height);
-        doRender();
+        doRender(kind, exportInfo);
     }
 
     /**************************************************************************************************
-    * Javascript function: Handels messages from GUI thread (Parent thread)
+    * Javascript function: Handles messages from GUI thread (Parent thread)
     * ************************************************************************************************/
-    function handelMessageParent(msg){                
+    function handleMessageParent(msg){                
         // We will be sent an offscreen canvas
         if(msg.data.hasOwnProperty('canvas')){  
 
             offscreen = msg.data.canvas;
             ctx = offscreen.getContext('2d');
             backBuffer = new ImageData(offscreen.width,offscreen.height);
+            previewWidth = offscreen.width;
+            previewHeight = offscreen.height;
             
             doRender();
             
             return;
         }
 
+        if (msg.data.hasOwnProperty('shutdown')) {
+            for (let i = 0; i < workers.length; i++) {
+                workers[i].terminate();
+            }
+            workers = [];
+            workerCount = 0;
+            close();
+            return;
+        }
+
+        let needsRender = false;
+
         if(msg.data.hasOwnProperty('seed')){
             seed = msg.data['seed'];
             isPreview = msg.data['isPreview'];
-            return;
+            needsRender = true;
         }
 
-        // Don't process other messages if we don't have the canvas.
+        if(msg.data.hasOwnProperty('params')){
+            currentParams = msg.data['params'];
+            needsRender = true;
+        }
+
+        // Don't process resize or render work if we don't have the canvas yet.
         if (typeof(offscreen) == "undefined" || typeof(ctx) == "undefined") return;
+
+        if (msg.data.hasOwnProperty('exportImage')){
+            if (activeJobKind === 'export') {
+                postMessage({'exportFailed':true, 'message':'Save already in progress.'});
+                return;
+            }
+
+            let exportWidth = Number(msg.data['width']);
+            let exportHeight = Number(msg.data['height']);
+            if (!Number.isFinite(exportWidth) || !Number.isFinite(exportHeight) || exportWidth <= 0 || exportHeight <= 0) {
+                postMessage({'exportFailed':true, 'message':'Save failed: invalid export size.'});
+                return;
+            }
+
+            if (msg.data.hasOwnProperty('previewWidth')) {
+                let width = Number(msg.data['previewWidth']);
+                if (Number.isFinite(width) && width > 0) previewWidth = width;
+            }
+            if (msg.data.hasOwnProperty('previewHeight')) {
+                let height = Number(msg.data['previewHeight']);
+                if (Number.isFinite(height) && height > 0) previewHeight = height;
+            }
+            if (msg.data.hasOwnProperty('seed')) seed = msg.data['seed'];
+            if (msg.data.hasOwnProperty('params')) currentParams = msg.data['params'];
+            isPreview = false;
+
+            resizeCanvas(
+                Math.round(exportWidth),
+                Math.round(exportHeight),
+                'export',
+                {
+                    filename: msg.data['filename'] || 'effects-town.png',
+                    label: msg.data['label'] || 'image',
+                }
+            );
+            return;
+        }
 
         //Canvas needs to be resized to match page.
         if (msg.data.hasOwnProperty('resize')){
-            resizeCanvas(msg.data.width, msg.data.height);
+            let width = Number(msg.data.width);
+            let height = Number(msg.data.height);
+            if (Number.isFinite(width) && width > 0) previewWidth = Math.round(width);
+            if (Number.isFinite(height) && height > 0) previewHeight = Math.round(height);
+            if (activeJobKind === 'export') return;
+            resizeCanvas(previewWidth, previewHeight);
             return;
         }
-        
+
+        if (activeJobKind === 'export') return;
+        if (needsRender) doRender();
 
     }
 
@@ -171,6 +275,33 @@ EM_JS (emscripten::EM_VAL, setup_workers, (), {
     function onRenderComplete(){
         const timeTaken = performance.now() - renderStartTime;
         console.log("Render Complete: " + timeTaken.toFixed(1) + " ms (" + offscreen.width + " x " + offscreen.height  +" pixels)");
+
+        if (activeJobKind !== 'export') return;
+
+        let exportInfo = activeExportInfo || {};
+        let filename = exportInfo.filename || 'effects-town.png';
+        let completedWidth = offscreen.width;
+        let completedHeight = offscreen.height;
+
+        offscreen.convertToBlob({type:'image/png'}).then(function(blob){
+            postMessage({
+                'exportComplete': true,
+                'blob': blob,
+                'filename': filename,
+                'width': completedWidth,
+                'height': completedHeight,
+            });
+        }).catch(function(){
+            postMessage({'exportFailed':true, 'message':'Save failed: unable to encode PNG.'});
+        }).finally(function(){
+            activeJobKind = 'preview';
+            activeExportInfo = undefined;
+            if (previewWidth > 0 && previewHeight > 0) {
+                resizeCanvas(previewWidth, previewHeight);
+            } else {
+                doRender();
+            }
+        });
     }
 
     /**************************************************************************************************
@@ -194,9 +325,9 @@ EM_JS (emscripten::EM_VAL, setup_workers, (), {
     }
 
     /**************************************************************************************************
-    * Javascript function: Handels messages from render workers (children of this thead)
+    * Javascript function: Handles messages from render workers (children of this thread)
     * ************************************************************************************************/
-    function handelMessageRender(msg){   
+    function handleMessageRender(msg){   
         let w = msg.target;
         if (msg.data.hasOwnProperty('result')){            
             startWorkerRender(w);
@@ -204,8 +335,9 @@ EM_JS (emscripten::EM_VAL, setup_workers, (), {
             return;
         }
 
-        if(msg.data.hasOwnProperty('loaded')){  
-            if (jobNumber>0) startWorkerRender(w); //If we have already started rendering we should initiate this thread              
+        if(msg.data.hasOwnProperty('loaded')){
+            if (workerCount == 0) postMessage({'paramDefs': msg.data['paramDefs']}); //Forward param defs from first worker to GUI.
+            if (jobNumber>0) startWorkerRender(w); //If we have already started rendering we should initiate this thread.
             workers.push(w);
             workerCount++;
             if (workerCount == numberWorkers) console.log(workerCount + " workers started.");

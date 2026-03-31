@@ -1,6 +1,6 @@
 /********************************************************************************************************
 
-Authors:		(c) 2023 Maths Town
+Authors:		(c) 2023-2026 Maths Town
 
 Licence:		The MIT License
 
@@ -37,7 +37,7 @@ Description:
 #include "after-effects-parameter-helper.h"
 #include "after-effects-render.h"
 
-#include "..\..\common\simd-cpuid.h"
+#include "simd-cpuid.h"
 #include "..\..\common\linear-algebra.h"
 
 #include <windows.h>
